@@ -5,8 +5,10 @@ from __future__ import annotations
 import argparse
 import base64
 import csv
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 import gzip
 import hashlib
+from http.client import IncompleteRead
 import io
 import json
 import os
@@ -14,10 +16,12 @@ import re
 import subprocess
 import sys
 import tempfile
+from threading import Event
 import time
 from datetime import datetime, timedelta, timezone
 from email.utils import format_datetime, parsedate_to_datetime
 from pathlib import Path
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 from urllib.parse import urlparse
 
@@ -36,6 +40,14 @@ SMALL_JSON_LIMIT = 1024 * 1024
 KEY_ID = "catalogue-v1"
 SIGNING_ENV = "CATALOGUE_SIGNING_PRIVATE_KEY"
 SHA = re.compile(r"[0-9a-f]{64}\Z")
+RANGE_THRESHOLD_BYTES = 8 * 1024 * 1024
+RANGE_CHUNK_BYTES = 4 * 1024 * 1024
+RANGE_WORKERS = 4
+DOWNLOAD_ATTEMPTS = 3
+RETRY_BACKOFF_SECONDS = 0.5
+CHUNK_DEADLINE_SECONDS = 180
+SOURCE_DEADLINE_SECONDS = 30 * 60
+TRANSIENT_HTTP_CODES = {408, 429, 500, 502, 503, 504}
 
 
 def canonical(value):
@@ -175,10 +187,10 @@ def source_date(sources):
     return max(parsedate_to_datetime(source["lastModified"]).date().isoformat() for source in sources)
 
 
-def _check_response(response, expected_url):
+def _check_response(response, expected_url, expected_status=200):
     final_url = response.geturl() if hasattr(response, "geturl") else expected_url
     parsed = urlparse(final_url)
-    if response.status != 200 or parsed.scheme != "https" or parsed.hostname != "opendata.astra.admin.ch":
+    if response.status != expected_status or parsed.scheme != "https" or parsed.hostname != "opendata.astra.admin.ch":
         raise ValueError("Official source request failed or redirected to an unexpected host")
 
 
@@ -231,45 +243,216 @@ def cached_source(source, cache_dir):
         return None
 
 
+class _RetryableDownload(Exception):
+    pass
+
+
+def _download_headers(source):
+    headers = {"Accept-Encoding": "identity", "User-Agent": "Carloss-Catalogue/1",
+               "If-Unmodified-Since": source["lastModified"]}
+    if source.get("etag") and not source["etag"].startswith("W/"):
+        headers["If-Match"] = source["etag"]
+    return headers
+
+
+def _validate_transfer_response(response, source, start=None, end=None):
+    expected = source["contentLength"] if start is None else end - start + 1
+    if response.status in TRANSIENT_HTTP_CODES:
+        raise _RetryableDownload(f"Transient HTTP {response.status}")
+    status = 206 if start is not None else 200
+    if response.status != status:
+        raise ValueError(f"Source {source['name']}: expected HTTP {status}, received HTTP {response.status}; "
+                         f"expected {expected} transfer bytes of {source['contentLength']} source bytes")
+    _check_response(response, source["url"], expected_status=status)
+    if response.headers.get("Content-Encoding", "identity").strip().lower() != "identity":
+        raise ValueError("Official source unexpectedly used content encoding")
+    try:
+        received_length = int(response.headers.get("Content-Length", ""))
+    except (TypeError, ValueError):
+        raise ValueError(f"Source {source['name']}: missing transfer length; expected {expected} bytes") from None
+    if received_length != expected:
+        raise ValueError(f"Source {source['name']}: transfer length mismatch; expected {expected} bytes, declared {received_length}")
+    if start is not None:
+        content_range = response.headers.get("Content-Range", "")
+        match = re.fullmatch(r"bytes (\d+)-(\d+)/(\d+)", content_range.strip(), re.IGNORECASE)
+        if not match or tuple(map(int, match.groups())) != (start, end, source["contentLength"]):
+            actual = "/".join(match.groups()) if match else "invalid"
+            raise ValueError(f"Source {source['name']}: Content-Range mismatch; expected {start}-{end}/{source['contentLength']}, received {actual}")
+    # A range advertises its chunk size; compare the remaining validators
+    # against the original complete representation observed by HEAD.
+    received = _source_info(source["name"], {"Content-Length": str(source["contentLength"]),
+        "ETag": response.headers.get("ETag"), "Last-Modified": response.headers.get("Last-Modified")})
+    if source_identity(received) != source_identity(source):
+        raise ValueError(f"Source {source['name']}: changed between HEAD and download; expected {source['contentLength']} source bytes")
+
+
+def _read_transfer_piece(response, maximum, deadline):
+    # HTTPResponse.read(n) may wait through many successful socket reads to
+    # accumulate n bytes. read1 returns after one buffered/underlying read,
+    # allowing the caller to check cancellation and the wall-clock deadline.
+    reader = getattr(response, "read1", None)
+    if not callable(reader):
+        raise ValueError("Official source transport does not support bounded single reads")
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise ValueError("Official source transfer deadline expired")
+    # urllib's HTTPResponse wraps the actual (TLS) socket in a BufferedReader.
+    # Reduce its idle timeout as the total transfer deadline approaches.
+    raw = getattr(getattr(response, "fp", None), "raw", None)
+    connection = getattr(raw, "_sock", None)
+    if connection is not None:
+        connection.settimeout(max(0.001, min(30, remaining)))
+    data = reader(maximum)
+    if time.monotonic() > deadline:
+        raise ValueError("Official source transfer deadline expired")
+    return data
+
+
+def _fetch_transfer(source, source_deadline, stopped, opener, start=None, end=None):
+    expected = source["contentLength"] if start is None else end - start + 1
+    deadline = min(source_deadline, time.monotonic() + CHUNK_DEADLINE_SECONDS)
+    headers = _download_headers(source)
+    if start is not None:
+        headers["Range"] = f"bytes={start}-{end}"
+    request = Request(source["url"], headers=headers)
+    last_failure = f"expected {expected} bytes, received 0"
+    for attempt in range(DOWNLOAD_ATTEMPTS):
+        if stopped.is_set() or time.monotonic() >= deadline:
+            raise ValueError(f"Source {source['name']}: cancelled or timed out; expected {expected} transfer bytes of {source['contentLength']} source bytes")
+        received_bytes = 0
+        try:
+            with opener(request, timeout=max(0.01, min(30, deadline - time.monotonic()))) as response:
+                _validate_transfer_response(response, source, start, end)
+                result = bytearray()
+                while True:
+                    if stopped.is_set() or time.monotonic() >= deadline:
+                        raise ValueError(f"Source {source['name']}: cancelled or timed out; expected {expected} transfer bytes, received {received_bytes}")
+                    # One extra byte detects a server exceeding its declared
+                    # bounds without buffering an unbounded response.
+                    try:
+                        chunk = _read_transfer_piece(response, min(256 * 1024, expected - len(result) + 1), deadline)
+                    except ValueError as error:
+                        raise ValueError(f"Source {source['name']}: {error}; expected {expected} transfer bytes, received {received_bytes}") from None
+                    if not chunk:
+                        break
+                    result.extend(chunk)
+                    received_bytes = len(result)
+                    if len(result) > expected:
+                        raise ValueError("Official source transfer exceeded its declared length")
+                if len(result) != expected:
+                    raise _RetryableDownload(f"expected {expected} bytes, received {len(result)}")
+                return result
+        except HTTPError as error:
+            if getattr(error, "fp", None) is not None:
+                try:
+                    error.close()
+                except (AttributeError, KeyError, OSError):
+                    pass
+            if error.code not in TRANSIENT_HTTP_CODES:
+                raise ValueError(f"Source {source['name']}: HTTP {error.code}, expected {expected} bytes") from None
+            last_failure = f"HTTP {error.code}; expected {expected} bytes, received {received_bytes}"
+        except (URLError, TimeoutError, ConnectionError, IncompleteRead, OSError, _RetryableDownload) as error:
+            last_failure = f"{type(error).__name__}; expected {expected} bytes, received {received_bytes}"
+        if attempt + 1 == DOWNLOAD_ATTEMPTS:
+            break
+        delay = min(RETRY_BACKOFF_SECONDS * 2 ** attempt, max(0, deadline - time.monotonic()))
+        print(f"Source {source['name']}: retrying {'range ' + str(start) + '-' + str(end) if start is not None else 'download'} "
+              f"(attempt {attempt + 2}/{DOWNLOAD_ATTEMPTS}).", flush=True)
+        if stopped.wait(delay):
+            raise ValueError("Official source download was cancelled")
+    part = f"range {start}-{end}, total {source['contentLength']}" if start is not None else f"total {source['contentLength']}"
+    raise ValueError(f"Source {source['name']}: incomplete transfer after {DOWNLOAD_ATTEMPTS} attempts ({part}; {last_failure})")
+
+
+def _download_ranges(handle, source, opener, source_deadline):
+    total = source["contentLength"]
+    if RANGE_CHUNK_BYTES <= 0 or RANGE_WORKERS <= 0:
+        raise ValueError("Invalid range download configuration")
+    workers = min(4, RANGE_WORKERS)
+    ranges = iter((start, min(total - 1, start + RANGE_CHUNK_BYTES - 1)) for start in range(0, total, RANGE_CHUNK_BYTES))
+    stopped = Event()
+    completed, next_progress = 0, 64 * 1024 * 1024
+    executor = ThreadPoolExecutor(max_workers=workers, thread_name_prefix="astra-range")
+    pending = {}
+    print(f"Source {source['name']}: downloading {total} bytes in {RANGE_CHUNK_BYTES}-byte ranges ({workers} workers).", flush=True)
+
+    def schedule():
+        while len(pending) < workers:
+            bounds = next(ranges, None)
+            if bounds is None:
+                return
+            start, end = bounds
+            future = executor.submit(_fetch_transfer, source, source_deadline, stopped, opener, start, end)
+            pending[future] = start
+
+    try:
+        schedule()
+        while pending:
+            remaining = source_deadline - time.monotonic()
+            if remaining <= 0:
+                raise ValueError("Official source exceeded its download deadline")
+            done, _ = wait(pending, timeout=remaining, return_when=FIRST_COMPLETED)
+            if not done:
+                raise ValueError("Official source exceeded its download deadline")
+            # Consume the complete finished batch before scheduling more work;
+            # completed buffers plus running requests remain bounded to four.
+            for future in done:
+                start = pending.pop(future)
+                data = future.result()
+                handle.seek(start)
+                handle.write(data)
+                completed += len(data)
+                del data
+            del future, done
+            if completed >= next_progress or completed == total:
+                print(f"Source {source['name']}: downloaded {completed}/{total} bytes.", flush=True)
+                next_progress = completed + 64 * 1024 * 1024
+            schedule()
+        if completed != total:
+            raise ValueError("Official source range coverage is incomplete")
+    finally:
+        stopped.set()
+        for future in pending:
+            future.cancel()
+        executor.shutdown(wait=True, cancel_futures=True)
+
+
 def download_source(source, cache_dir, previous_header=None, opener=urlopen):
     reused = cached_source(source, cache_dir)
     if reused:
         path, metadata = reused
         validate_header(source["name"], csv_header(path), previous_header)
+        print(f"Source {source['name']}: reusing {source['contentLength']} cached bytes.", flush=True)
         return path, metadata
     directory = Path(cache_dir)
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / (source["name"] + ".csv")
-    headers = {"Accept-Encoding": "identity", "User-Agent": "Carloss-Catalogue/1",
-               "If-Unmodified-Since": source["lastModified"]}
-    if source.get("etag") and not source["etag"].startswith("W/"):
-        headers["If-Match"] = source["etag"]
-    request = Request(source["url"], headers=headers)
     name = None
     try:
-        with opener(request, timeout=30) as response:
-            _check_response(response, source["url"])
-            received = _source_info(source["name"], response.headers)
-            if source_identity(received) != source_identity(source):
-                raise ValueError("Source changed between HEAD and download; retry on the next run")
-            size, digest, deadline = 0, hashlib.sha256(), time.monotonic() + 15 * 60
-            with tempfile.NamedTemporaryFile(dir=directory, prefix=".astra-", delete=False) as handle:
-                name = Path(handle.name)
-                while chunk := response.read(1024 * 1024):
-                    size += len(chunk)
-                    if size > source["contentLength"] or size > RAW_LIMIT or time.monotonic() > deadline:
-                        raise ValueError("Source download exceeded its size or time limit")
-                    digest.update(chunk)
-                    handle.write(chunk)
-                if size != source["contentLength"]:
-                    raise ValueError("Incomplete source download")
-            header = csv_header(name)
-            validate_header(source["name"], header, previous_header)
-            metadata = {**source, "downloadSHA256": digest.hexdigest(), "header": header,
-                        "headerSHA256": hashlib.sha256(canonical(header)).hexdigest()}
-            os.replace(name, path)
-            atomic_write(path.with_suffix(".metadata.json"), canonical(metadata) + b"\n")
-            return path, metadata
+        size = source["contentLength"]
+        if type(size) is not int or not 0 < size <= RAW_LIMIT:
+            raise ValueError("Official source exceeds its size limit")
+        deadline = time.monotonic() + SOURCE_DEADLINE_SECONDS
+        with tempfile.NamedTemporaryFile(dir=directory, prefix=".astra-", delete=False) as handle:
+            name = Path(handle.name)
+            handle.truncate(size)
+            if size >= RANGE_THRESHOLD_BYTES:
+                _download_ranges(handle, source, opener, deadline)
+            else:
+                print(f"Source {source['name']}: downloading {size} bytes.", flush=True)
+                handle.write(_fetch_transfer(source, deadline, Event(), opener))
+            handle.flush()
+            os.fsync(handle.fileno())
+        print(f"Source {source['name']}: validating complete file and CSV header.", flush=True)
+        download_sha = digest_file(name)
+        header = csv_header(name)
+        validate_header(source["name"], header, previous_header)
+        metadata = {**source, "downloadSHA256": download_sha, "header": header,
+                    "headerSHA256": hashlib.sha256(canonical(header)).hexdigest()}
+        os.replace(name, path)
+        atomic_write(path.with_suffix(".metadata.json"), canonical(metadata) + b"\n")
+        print(f"Source {source['name']}: cached {size} verified bytes.", flush=True)
+        return path, metadata
     finally:
         if name and name.exists():
             name.unlink()

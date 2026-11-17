@@ -40,6 +40,8 @@ The workflow checks the three official sources daily at **03:17 UTC** and can be
 
 When rebuilding, a temporary Actions cache supplies unchanged input files. Only changed or missing cache inputs are downloaded. A cold cache needs an initial copy of each input because the normalizer joins all three sources. Raw files never enter this repository. Downloads stream to temporary files, enforce HTTPS and the official host, have connection and transfer deadlines, and are bounded to 2 GiB per input and 2 GiB for the complete source set.
 
+Large source files use 4 MiB HTTP ranges with at most four concurrent transfers. Each response must match its exact range and the original source validators; interrupted transfers have bounded retries. Completed files are hashed and their CSV headers checked before entering the reusable cache. The workflow checks its signing key before restoring or downloading source files.
+
 Before publication the pipeline rejects changed established CSV headers, missing required columns, unknown catalogue fields, duplicate IDs, invalid units or standards, invalid capacities, source-date regressions and substantial coverage loss. It validates 10,000–100,000 variants, JSON below 32 MiB and deterministic gzip below 4 MiB. The signed manifest is replaced atomically only after its immutable payload exists and the signature matches the pinned public key. Errors leave the previous publication available. Source headers, hashes and aggregate coverage are recorded in provenance; raw rows are not.
 
 ## Maintainer setup

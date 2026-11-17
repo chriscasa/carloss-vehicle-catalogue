@@ -36,6 +36,23 @@ jobs:
           python tools/publish_catalogue.py --check-sources
           --plan "$RUNNER_TEMP/catalogue-plan.json"
           --github-output "$GITHUB_OUTPUT" $FORCE
+      - name: Check signing key
+        if: steps.sources.outputs.needs-build == 'true'
+        env:
+          CATALOGUE_SIGNING_PRIVATE_KEY: ${{ secrets.CATALOGUE_SIGNING_PRIVATE_KEY }}
+        run: |
+          python - <<'PY'
+          import base64, os, sys
+          from pathlib import Path
+          sys.path.insert(0, str(Path('tools').resolve()))
+          from publish_catalogue import read_json, sign, verify_signature
+          wrapper = read_json(Path('v1/manifest.json'))
+          payload = base64.b64decode(wrapper['payload'], validate=True)
+          signature = sign(payload, os.environ.get('CATALOGUE_SIGNING_PRIVATE_KEY'))
+          wrapper['signature'] = base64.b64encode(signature).decode('ascii')
+          verify_signature(wrapper, Path('catalogue-v1.pub'))
+          print('Actions signing key matches the pinned public key.')
+          PY
       - name: Reuse official source downloads
         if: steps.sources.outputs.needs-build == 'true'
         uses: actions/cache@v4
