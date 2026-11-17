@@ -1,0 +1,66 @@
+name: Update vehicle catalogue
+
+on:
+  schedule:
+    - cron: '17 3 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild even when source metadata is unchanged
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: catalogue-publish
+  cancel-in-progress: false
+
+jobs:
+  catalogue:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Test publication and validation
+        run: python -m unittest discover -s tests -v
+      - name: Check official source metadata
+        id: sources
+        env:
+          FORCE: ${{ inputs.force == true && '--force' || '' }}
+        run: >-
+          python tools/publish_catalogue.py --check-sources
+          --plan "$RUNNER_TEMP/catalogue-plan.json"
+          --github-output "$GITHUB_OUTPUT" $FORCE
+      - name: Reuse official source downloads
+        if: steps.sources.outputs.needs-build == 'true'
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/astra-source-cache
+          key: astra-source-v1-${{ runner.os }}-${{ steps.sources.outputs.fingerprint }}
+          restore-keys: astra-source-v1-${{ runner.os }}-
+      - name: Build and sign catalogue
+        if: steps.sources.outputs.needs-build == 'true'
+        env:
+          CATALOGUE_SIGNING_PRIVATE_KEY: ${{ secrets.CATALOGUE_SIGNING_PRIVATE_KEY }}
+        run: >-
+          python tools/publish_catalogue.py --publish
+          --plan "$RUNNER_TEMP/catalogue-plan.json"
+          --cache-dir "$RUNNER_TEMP/astra-source-cache"
+      - name: Verify signed publication
+        run: python tools/publish_catalogue.py --verify
+      - name: Commit published data
+        run: |
+          if git diff --quiet -- v1 && [ -z "$(git ls-files --others --exclude-standard v1)" ]; then
+            echo "Catalogue unchanged."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -- v1
+          git commit -m "Update published vehicle catalogue"
+          git push
